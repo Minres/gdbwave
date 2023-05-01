@@ -5,6 +5,7 @@
 #include <vector>
 
 #include <FstProcess.h>
+#include "sparse_array.h"
 
 struct MemAccess
 {
@@ -30,9 +31,9 @@ public:
     FstProcess &    fstProc;
 
     // Memory initialization values at bootup
-    string              memInitFileName;
-    unsigned int        memInitStartAddr;
-    std::vector<char>   memInitContents;
+    string                          memInitFileName;
+    unsigned int                    memInitStartAddr;
+    sparse_array<uint8_t, 1ULL<<32> memInitContents;
 
     // Handles to signals inside the FST file
     FstSignal       clk;

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <elfio/elfio.hpp>
 
 using namespace std;
 
@@ -13,21 +14,21 @@ using namespace std;
 extern bool verbose;
 
 MemTrace::MemTrace(FstProcess & fstProc, string memInitFileName, int memInitStartAddr,  
-                FstSignal clk, 
-                FstSignal memCmdValid, FstSignal memCmdReady, FstSignal memCmdAddr, FstSignal memCmdSize, FstSignal memCmdWr, FstSignal memCmdWrData,
-                FstSignal memRspValid, FstSignal memRspData) :
-    fstProc(fstProc), 
-    memInitFileName(memInitFileName),
-    memInitStartAddr(memInitStartAddr),
-    clk(clk),
-    memCmdValid(memCmdValid),
-    memCmdReady(memCmdReady),
-    memCmdAddr(memCmdAddr),
-    memCmdSize(memCmdSize),
-    memCmdWr(memCmdWr),
-    memCmdWrData(memCmdWrData),
-    memRspValid(memRspValid),
-    memRspData(memRspData)
+        FstSignal clk,
+        FstSignal memCmdValid, FstSignal memCmdReady, FstSignal memCmdAddr, FstSignal memCmdSize, FstSignal memCmdWr, FstSignal memCmdWrData,
+        FstSignal memRspValid, FstSignal memRspData) :
+                    fstProc(fstProc),
+                    memInitFileName(memInitFileName),
+                    memInitStartAddr(memInitStartAddr),
+                    clk(clk),
+                    memCmdValid(memCmdValid),
+                    memCmdReady(memCmdReady),
+                    memCmdAddr(memCmdAddr),
+                    memCmdSize(memCmdSize),
+                    memCmdWr(memCmdWr),
+                    memCmdWrData(memCmdWrData),
+                    memRspValid(memRspValid),
+                    memRspData(memRspData)
 {
     init();
 }
@@ -97,9 +98,9 @@ void MemTrace::processSignalChanged(uint64_t time, FstSignal *signal, const unsi
             if (curMemCmdWr){
                 int byteEna = 0;
                 switch(curMemCmdSize){
-                    case 0:  byteEna     = 1 << (curMemCmdAddr & 3); break;
-                    case 1:  byteEna     = 3 << (curMemCmdAddr & 3); break;
-                    default: byteEna     = 15; break;
+                case 0:  byteEna     = 1 << (curMemCmdAddr & 3); break;
+                case 1:  byteEna     = 3 << (curMemCmdAddr & 3); break;
+                default: byteEna     = 15; break;
                 }
 
                 for(int byteNr=0; byteNr<4;++byteNr){
@@ -121,13 +122,53 @@ void MemTrace::processSignalChanged(uint64_t time, FstSignal *signal, const unsi
 void MemTrace::init()
 {
     if (!memInitFileName.empty()){
-        LOG_INFO("Loading mem init file: %s", memInitFileName.c_str());
-        ifstream initFile(memInitFileName, ios::in | ios::binary);
-        if (initFile.fail()){
-            LOG_ERROR("Error opening mem init file: %s (%s)", memInitFileName.c_str(), strerror(errno));
-            exit(1);
+        FILE* fp = fopen(memInitFileName.c_str(), "r");
+        if(fp) {
+            std::array<char, 5> buf;
+            auto n = fread(buf.data(), 1, 4, fp);
+            fclose(fp);
+            if(n != 4)
+                throw std::runtime_error("input file has insufficient size");
+            buf[4] = 0;
+            if(strcmp(buf.data() + 1, "ELF") == 0) {
+                // Create elfio reader
+                ELFIO::elfio reader;
+                // Load ELF data
+                if(!reader.load(memInitFileName))
+                    throw std::runtime_error("could not process elf file");
+                // check elf properties
+                if(reader.get_class() != ELFCLASS32)
+                    throw std::runtime_error("wrong elf class in file");
+                if(reader.get_type() != ET_EXEC)
+                    throw std::runtime_error("wrong elf type in file");
+                if(reader.get_machine() != EM_RISCV)
+                    throw std::runtime_error("wrong elf machine in file");
+                for(const auto pseg : reader.segments) {
+                    const auto fsize = pseg->get_file_size(); // 0x42c/0x0
+                    const auto seg_data = pseg->get_data();
+                    if(fsize > 0) {
+                        auto addr = pseg->get_physical_address();
+                        auto ptr = reinterpret_cast<const uint8_t* const>(seg_data);
+                        auto& p = memInitContents(addr / memInitContents.page_size);
+                        auto offs = addr & memInitContents.page_addr_mask;
+                        std::copy(ptr, ptr + fsize, p.data() + offs);
+                    }
+                }
+            } else {
+
+                LOG_INFO("Loading mem init file: %s", memInitFileName.c_str());
+                ifstream initFile(memInitFileName, ios::in | ios::binary);
+                if (initFile.fail()){
+                    LOG_ERROR("Error opening mem init file: %s (%s)", memInitFileName.c_str(), strerror(errno));
+                    exit(1);
+                }
+                vector<char> content((std::istreambuf_iterator<char>(initFile)), std::istreambuf_iterator<char>());
+                auto addr = memInitStartAddr;
+                for(auto v:content) {
+                    memInitContents[addr++] = v;
+                }
+            }
         }
-        memInitContents = vector<char>((std::istreambuf_iterator<char>(initFile)), std::istreambuf_iterator<char>());
     }
 
     vector<FstSignal *> sigs;
@@ -165,13 +206,8 @@ void MemTrace::init()
 
 bool MemTrace::getValue(uint64_t time, uint64_t addr, char *value)
 {
-    bool        valueValid = false;
-    uint64_t    val = 0;
-
-    if (addr >= memInitStartAddr && addr < (memInitStartAddr + memInitContents.size())){
-        valueValid = true;
-        val = memInitContents[addr - memInitStartAddr];
-    }
+    bool valueValid = memInitContents.is_allocated(addr);
+    uint64_t val = memInitContents[addr];
 
     for(auto m: memTrace){
         if (m.time > time)
